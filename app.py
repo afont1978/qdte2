@@ -248,7 +248,7 @@ def kpi_block(label: str, value: str, delta: str = "") -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_overview(df: pd.DataFrame, latest: Dict[str, Any], running: bool = False) -> None:
+def render_overview(df: pd.DataFrame, latest: Dict[str, Any], running: bool = False, render_id: str = "base") -> None:
     if df.empty:
         st.info("No simulation data yet. Press Step or Start.")
         return
@@ -297,15 +297,15 @@ def render_overview(df: pd.DataFrame, latest: Dict[str, Any], running: bool = Fa
 
     left, right = st.columns([2.2, 1.0])
     with left:
-        st.plotly_chart(make_area_balance_chart(live_df, key="overview_balance"), use_container_width=True, key="plot_overview_balance")
+        st.plotly_chart(make_area_balance_chart(live_df, key=f"overview_balance_{render_id}"), use_container_width=True, key=f"plot_overview_balance_{render_id}")
         c_a, c_b = st.columns(2)
         with c_a:
-            st.plotly_chart(make_storage_chart(live_df, key="overview_storage"), use_container_width=True, key="plot_overview_storage")
+            st.plotly_chart(make_storage_chart(live_df, key=f"overview_storage_{render_id}"), use_container_width=True, key=f"plot_overview_storage_{render_id}")
         with c_b:
-            st.plotly_chart(make_cost_chart(live_df, key="overview_cost"), use_container_width=True, key="plot_overview_cost")
+            st.plotly_chart(make_cost_chart(live_df, key=f"overview_cost_{render_id}"), use_container_width=True, key=f"plot_overview_cost_{render_id}")
     with right:
-        st.plotly_chart(make_route_chart(df, key="overview_routes"), use_container_width=True, key="plot_overview_routes")
-        st.plotly_chart(make_event_chart(df, key="overview_events"), use_container_width=True, key="plot_overview_events")
+        st.plotly_chart(make_route_chart(df, key=f"overview_routes_{render_id}"), use_container_width=True, key=f"plot_overview_routes_{render_id}")
+        st.plotly_chart(make_event_chart(df, key=f"overview_events_{render_id}"), use_container_width=True, key=f"plot_overview_events_{render_id}")
         st.markdown("### Current decision")
         st.write(f"**Route:** {route_txt}")
         st.write(f"**Confidence:** {latest.get('decision_confidence', 0.0) * 100:.1f}%")
@@ -400,7 +400,7 @@ with tab_overview:
     initial_df = get_df()
     initial_latest = latest_record(initial_df)
     with overview_placeholder.container():
-        render_overview(initial_df, initial_latest, running=ss["running"])
+        render_overview(initial_df, initial_latest, running=ss["running"], render_id="initial")
 
     if ss["running"]:
         # Animate visible steps inside the same run so charts visibly evolve.
@@ -409,7 +409,7 @@ with tab_overview:
             step_df = get_df()
             step_latest = latest_record(step_df)
             with overview_placeholder.container():
-                render_overview(step_df, step_latest, running=True)
+                render_overview(step_df, step_latest, running=True, render_id=f"live_{ss['rt'].step_id}_{_}")
             time.sleep(float(ss["sleep_s"]))
         st.rerun()
 
