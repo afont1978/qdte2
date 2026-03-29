@@ -594,12 +594,35 @@ class EnergyHybridOrchestrator:
         self.quantum = MockQuantumEnergySolver(seed=seed)
 
     def choose_route(self, problem: DispatchProblem) -> Route:
-        if problem.mode == "resilience":
+        event = problem.metadata.get("active_event")
+        resilience_margin_h = float(problem.metadata.get("resilience_margin_h", 0.0))
+        grid_status = problem.metadata.get("grid_status", "ON")
+        price_spike = bool(problem.metadata.get("price_spike", False))
+        solar_surplus = bool(problem.metadata.get("solar_surplus", False))
+        flex_request = bool(problem.metadata.get("flex_request", False))
+
+        if problem.mode == "resilience" and (grid_status != "ON" or resilience_margin_h < 1.5):
             return "CLASSICAL"
-        if problem.complexity_score < 4.0:
+
+        if problem.complexity_score < 4.8 or problem.discrete_ratio < 0.40:
             return "CLASSICAL"
-        if problem.discrete_ratio >= 0.45 and problem.horizon_steps >= 8:
+
+        if solar_surplus or price_spike or flex_request:
             return "QUANTUM"
+
+        if problem.mode == "resilience" and resilience_margin_h >= 1.5 and event in {"brownout", "reserve_breach_risk"}:
+            return "QUANTUM"
+
+        if problem.mode == "market":
+            if problem.complexity_score >= 5.6 and problem.discrete_ratio >= 0.50:
+                return "QUANTUM"
+            return "CLASSICAL"
+
+        if problem.mode == "economic":
+            if problem.complexity_score >= 5.2 and problem.discrete_ratio >= 0.50:
+                return "QUANTUM"
+            return "CLASSICAL"
+
         return "CLASSICAL"
 
     def solve(self, state: Dict[str, Any], problem: DispatchProblem) -> Dict[str, Any]:
@@ -625,12 +648,14 @@ class EnergyHybridOrchestrator:
         fallback_reasons: List[str] = []
         fallback_triggered = False
         exec_ms = int(result["backend"]["queue_ms"] + result["backend"]["exec_ms"])
-        latency_breach = exec_ms > 1500
+        latency_limit_ms = 1200 if problem.mode == "market" else 1400 if problem.mode == "economic" else 1000
+        latency_breach = exec_ms > latency_limit_ms
 
         if latency_breach:
             fallback_triggered = True
             fallback_reasons.append("SLA_BREACH")
-        if confidence < 0.72:
+        confidence_floor = 0.74 if problem.mode == "market" else 0.72
+        if confidence < confidence_floor:
             fallback_triggered = True
             fallback_reasons.append("LOW_CONFIDENCE")
 
@@ -773,25 +798,41 @@ class EnergyRuntime:
     def aggregate_state(self, ctx: ScenarioContext) -> Dict[str, Any]:
         pv = self.twins["pv_array"]
         batt = self.twins["battery"]
+        elz = self.twins["electrolyzer"]
         h2 = self.twins["h2_tank"]
+        fc = self.twins["fuel_cell"]
         grid = self.twins["grid_connection"]
         crit = self.twins["critical_load_block"]
         flex = self.twins["flex_load_block"]
         assert isinstance(pv, PVArrayTwin)
         assert isinstance(batt, BatteryTwin)
+        assert isinstance(elz, ElectrolyzerTwin)
         assert isinstance(h2, HydrogenTankTwin)
+        assert isinstance(fc, FuelCellTwin)
         assert isinstance(grid, GridConnectionTwin)
         assert isinstance(crit, LoadBlockTwin)
         assert isinstance(flex, LoadBlockTwin)
         active_event = ctx.active_events[0].event_type if ctx.active_events else None
+
+        critical_load_kw = crit.requested_kw
+        total_load_kw = crit.requested_kw + flex.requested_kw
+
+        battery_backup_h = max(0.0, batt.energy_kwh - batt.reserve_locked_kwh) / max(critical_load_kw, 1e-6)
+        h2_backup_h = max(0.0, h2.level_kg - h2.min_reserve_kg) * fc.eta_electric * fc.h2_lhv_kwhkg / max(critical_load_kw, 1e-6)
+        resilience_margin_h_est = battery_backup_h + h2_backup_h
+
+        solar_surplus_flag = pv.p_available_kw > total_load_kw * 1.05
+        price_spike_flag = active_event == "price_spike"
+        flex_request_flag = active_event == "flex_request"
+
         return {
             "ts": utc_now_iso(),
             "mode": ctx.mode,
             "scenario": ctx.scenario,
             "active_event": active_event,
-            "critical_load_kw": crit.requested_kw,
+            "critical_load_kw": critical_load_kw,
             "flexible_load_kw": flex.requested_kw,
-            "total_load_kw": crit.requested_kw + flex.requested_kw,
+            "total_load_kw": total_load_kw,
             "pv_available_kw": pv.p_available_kw,
             "battery_soc": batt.soc,
             "battery_energy_kwh": batt.energy_kwh,
@@ -799,14 +840,45 @@ class EnergyRuntime:
             "grid_status": grid.grid_status,
             "import_price_eur_kwh": grid.import_price_eur_kwh,
             "export_price_eur_kwh": grid.export_price_eur_kwh,
+            "resilience_margin_h_est": resilience_margin_h_est,
+            "solar_surplus_flag": solar_surplus_flag,
+            "price_spike_flag": price_spike_flag,
+            "flex_request_flag": flex_request_flag,
         }
 
     def build_problem(self, state: Dict[str, Any], ctx: ScenarioContext) -> DispatchProblem:
         discrete_vars = 5
         continuous_vars = 4
-        event_bonus = 1.2 if ctx.active_events else 0.0
-        mode_bonus = 1.5 if ctx.mode == "market" else 0.6 if ctx.mode == "economic" else 0.2
-        complexity = discrete_vars * 0.8 + continuous_vars * 0.25 + event_bonus + mode_bonus
+
+        event_bonus = 0.0
+        if state["solar_surplus_flag"]:
+            event_bonus += 1.2
+        if state["price_spike_flag"]:
+            event_bonus += 1.0
+        if state["flex_request_flag"]:
+            event_bonus += 1.4
+        if state["active_event"] == "brownout":
+            event_bonus += 1.1
+        if state["active_event"] == "reserve_breach_risk":
+            event_bonus += 1.0
+
+        mode_bonus = 0.0
+        if ctx.mode == "market":
+            mode_bonus = 1.4
+        elif ctx.mode == "economic":
+            mode_bonus = 0.8
+        elif ctx.mode == "resilience":
+            mode_bonus = 0.5
+
+        coupling_bonus = 0.0
+        if state["battery_soc"] > 0.75 and state["h2_level_kg"] < 0.85 * 80.0:
+            coupling_bonus += 0.8
+        if state["pv_available_kw"] > 0.85 * state["total_load_kw"]:
+            coupling_bonus += 0.6
+        if state["resilience_margin_h_est"] < 2.5:
+            coupling_bonus += 0.8
+
+        complexity = discrete_vars * 0.75 + continuous_vars * 0.25 + event_bonus + mode_bonus + coupling_bonus
         discrete_ratio = discrete_vars / max(discrete_vars + continuous_vars, 1)
         constraints = {
             "power_balance_target_kw": state["total_load_kw"],
@@ -815,6 +887,7 @@ class EnergyRuntime:
             "battery_energy_kwh": state["battery_energy_kwh"],
             "h2_level_kg": state["h2_level_kg"],
             "grid_status": state["grid_status"],
+            "resilience_margin_h_est": state["resilience_margin_h_est"],
         }
         objective_terms = {
             "grid_import_cost_weight": state["import_price_eur_kwh"],
@@ -823,6 +896,18 @@ class EnergyRuntime:
             "unserved_critical_weight": 5.0,
             "unserved_flex_weight": 0.4,
             "export_revenue_weight": state["export_price_eur_kwh"],
+        }
+        metadata = {
+            "active_event": state["active_event"],
+            "grid_status": state["grid_status"],
+            "resilience_margin_h": state["resilience_margin_h_est"],
+            "price_spike": state["price_spike_flag"],
+            "solar_surplus": state["solar_surplus_flag"],
+            "flex_request": state["flex_request_flag"],
+            "battery_soc": state["battery_soc"],
+            "h2_level_kg": state["h2_level_kg"],
+            "pv_available_kw": state["pv_available_kw"],
+            "total_load_kw": state["total_load_kw"],
         }
         return DispatchProblem(
             step_id=self.step_id,
@@ -834,7 +919,7 @@ class EnergyRuntime:
             complexity_score=complexity,
             discrete_ratio=discrete_ratio,
             horizon_steps=12,
-            metadata={"active_event": state["active_event"]},
+            metadata=metadata,
         )
 
     def validate_dispatch(self, dispatch: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
