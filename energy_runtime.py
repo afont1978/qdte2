@@ -600,26 +600,34 @@ class EnergyHybridOrchestrator:
         price_spike = bool(problem.metadata.get("price_spike", False))
         solar_surplus = bool(problem.metadata.get("solar_surplus", False))
         flex_request = bool(problem.metadata.get("flex_request", False))
+        battery_soc = float(problem.metadata.get("battery_soc", 0.0))
+        h2_level = float(problem.metadata.get("h2_level_kg", 0.0))
+        pv_available = float(problem.metadata.get("pv_available_kw", 0.0))
+        total_load = float(problem.metadata.get("total_load_kw", 1.0))
 
-        if problem.mode == "resilience" and (grid_status != "ON" or resilience_margin_h < 1.5):
+        # Respuesta inmediata de seguridad: siempre clásica.
+        if problem.mode == "resilience" and (grid_status != "ON" or event == "grid_outage" or resilience_margin_h < 1.5):
             return "CLASSICAL"
 
-        if problem.complexity_score < 4.8 or problem.discrete_ratio < 0.40:
-            return "CLASSICAL"
-
-        if solar_surplus or price_spike or flex_request:
-            return "QUANTUM"
-
-        if problem.mode == "resilience" and resilience_margin_h >= 1.5 and event in {"brownout", "reserve_breach_risk"}:
-            return "QUANTUM"
-
-        if problem.mode == "market":
-            if problem.complexity_score >= 5.6 and problem.discrete_ratio >= 0.50:
+        # Operación económica: clásica por defecto; híbrida solo si hay un detonante real.
+        if problem.mode == "economic":
+            if price_spike:
+                return "QUANTUM"
+            if solar_surplus and h2_level < 65.0 and pv_available > total_load * 0.98 and battery_soc < 0.60:
                 return "QUANTUM"
             return "CLASSICAL"
 
-        if problem.mode == "economic":
-            if problem.complexity_score >= 5.2 and problem.discrete_ratio >= 0.50:
+        # Mercado: clásica salvo solicitud de flexibilidad u oportunidad fuerte.
+        if problem.mode == "market":
+            if flex_request and problem.complexity_score >= 4.8:
+                return "QUANTUM"
+            if price_spike and pv_available > 0.85 * total_load and problem.complexity_score >= 4.7:
+                return "QUANTUM"
+            return "CLASSICAL"
+
+        # Resiliencia no crítica: permitir híbrido en brownout / gestión de reservas.
+        if problem.mode == "resilience":
+            if event in {"brownout", "reserve_breach_risk"} and grid_status == "ON" and resilience_margin_h >= 1.5 and problem.complexity_score >= 4.4:
                 return "QUANTUM"
             return "CLASSICAL"
 
@@ -852,33 +860,30 @@ class EnergyRuntime:
 
         event_bonus = 0.0
         if state["solar_surplus_flag"]:
-            event_bonus += 1.2
-        if state["price_spike_flag"]:
             event_bonus += 1.0
+        if state["price_spike_flag"]:
+            event_bonus += 1.2
         if state["flex_request_flag"]:
-            event_bonus += 1.4
+            event_bonus += 1.5
         if state["active_event"] == "brownout":
             event_bonus += 1.1
         if state["active_event"] == "reserve_breach_risk":
             event_bonus += 1.0
+        if state["active_event"] == "grid_outage":
+            event_bonus += 0.6
 
-        mode_bonus = 0.0
-        if ctx.mode == "market":
-            mode_bonus = 1.4
-        elif ctx.mode == "economic":
-            mode_bonus = 0.8
-        elif ctx.mode == "resilience":
-            mode_bonus = 0.5
+        mode_bonus = {"economic": 0.35, "market": 0.65, "resilience": 0.25}[ctx.mode]
 
         coupling_bonus = 0.0
-        if state["battery_soc"] > 0.75 and state["h2_level_kg"] < 0.85 * 80.0:
-            coupling_bonus += 0.8
-        if state["pv_available_kw"] > 0.85 * state["total_load_kw"]:
+        if state["battery_soc"] > 0.75 and state["h2_level_kg"] < 55.0:
             coupling_bonus += 0.6
+        if state["pv_available_kw"] > 1.08 * state["total_load_kw"]:
+            coupling_bonus += 0.5
         if state["resilience_margin_h_est"] < 2.5:
-            coupling_bonus += 0.8
+            coupling_bonus += 0.5
 
-        complexity = discrete_vars * 0.75 + continuous_vars * 0.25 + event_bonus + mode_bonus + coupling_bonus
+        base_complexity = discrete_vars * 0.42 + continuous_vars * 0.18
+        complexity = base_complexity + event_bonus + mode_bonus + coupling_bonus
         discrete_ratio = discrete_vars / max(discrete_vars + continuous_vars, 1)
         constraints = {
             "power_balance_target_kw": state["total_load_kw"],
