@@ -1,15 +1,6 @@
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-.venv/
-venv/
-.env
-.streamlit/secrets.toml
-.ipynb_checkpoints/
-.DS_Store
-Thumbs.db
-*.csv
-*.jsonl
+services:
+  control-room:
+    build: .
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
